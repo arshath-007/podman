@@ -53,6 +53,38 @@ jobs:
           wsl --version
           if ($LASTEXITCODE) { exit $LASTEXITCODE }
           wsl --status
+      - name: Prepare directory lock diagnostics
+        shell: pwsh
+        run: |
+          $folder = Join-Path $env:RUNNER_TEMP "handle-30359"
+          New-Item -ItemType Directory -Path $folder -Force | Out-Null
+          $zip = Join-Path $folder "Handle.zip"
+          Invoke-WebRequest -Uri "https://download.sysinternals.com/files/Handle.zip" -OutFile $zip
+          Expand-Archive -LiteralPath $zip -DestinationPath $folder -Force
+          $handle = Join-Path $folder "handle64.exe"
+          $sig = Get-AuthenticodeSignature -LiteralPath $handle
+          if ($sig.Status -ne 'Valid' -or $sig.SignerCertificate.Subject -notmatch 'Microsoft Corporation') { throw 'Invalid Handle signature' }
+          "PODMAN_30359_HANDLE=$handle" | Out-File -FilePath $env:GITHUB_ENV -Encoding utf8 -Append
+          $path = "pkg/machine/e2e/start_windows_test.go"
+          $source = Get-Content -LiteralPath $path -Raw
+          $needle = 'Expect(os.Remove(dir)).To(Succeed())'
+          if ([regex]::Matches($source, [regex]::Escape($needle)).Count -ne 1) { throw 'Expected one removal assertion' }
+          $replacement = @'
+          if removeErr := os.Remove(dir); removeErr != nil {
+              GinkgoWriter.Printf("30359 removal failed: %v\n", removeErr)
+              diagCtx, cancelDiag := context.WithTimeout(context.Background(), 30*time.Second)
+              defer cancelDiag()
+              diag := exec.CommandContext(diagCtx, os.Getenv("PODMAN_30359_HANDLE"), "-accepteula", "-nobanner", filepath.Base(dir))
+              diag.WaitDelay = 5*time.Second
+              report, diagErr := diag.CombinedOutput()
+              GinkgoWriter.Printf("30359 HANDLE OUTPUT (err=%v):\n%s\n", diagErr, report)
+              Expect(removeErr).To(Succeed())
+          }
+          '@
+          $source.Replace($needle, $replacement.TrimEnd()) | Set-Content -LiteralPath $path -Encoding utf8 -NoNewline
+          gofmt -w $path
+          if ($LASTEXITCODE) { exit $LASTEXITCODE }
+
       - name: Run directory deletion and API forwarding regression
         shell: pwsh
         run: |
