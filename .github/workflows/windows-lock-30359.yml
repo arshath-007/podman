@@ -1,50 +1,51 @@
-name: Windows directory lock 30359
+name: Podman 30359 Final Validation
+
 on:
   push:
     branches: [test/30359-windows-lock]
+  workflow_dispatch:
+
 permissions:
   contents: read
+
 jobs:
-  verify:
-    if: github.repository == 'arshath-007/podman' && github.event.repository.private == false
+  verify-combined:
     runs-on: windows-2025
     timeout-minutes: 55
-    strategy:
-      fail-fast: false
-      matrix:
-        variant: [baseline, proxy, bootstrap, combined]
     env:
       CONTAINERS_MACHINE_PROVIDER: wsl
       WSL_UTF8: '1'
-      VARIANT: ${{ matrix.variant }}
+
     steps:
+      - name: Configure line endings
+        run: git config --global core.autocrlf false
+
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1
         with:
           persist-credentials: false
+
       - uses: actions/setup-go@d8cbb8045d7f43706b9177cceb36c1f91a6644d5
         with:
           go-version: '1.26.8'
           cache: false
-      - name: Prepare candidate
+
+      - name: Apply complete fix
         shell: pwsh
         run: |
-          git apply --include=pkg/machine/e2e/start_windows_test.go 30359.patch
+          git apply --check 30359.patch
           if ($LASTEXITCODE) { exit $LASTEXITCODE }
-          if ($env:VARIANT -in 'proxy','combined') {
-            git apply --include=pkg/machine/machine_windows.go 30359.patch
-            if ($LASTEXITCODE) { exit $LASTEXITCODE }
-          }
-          if ($env:VARIANT -in 'bootstrap','combined') {
-            git apply --include=pkg/machine/wsl/stubber.go 30359.patch
-            if ($LASTEXITCODE) { exit $LASTEXITCODE }
-          }
-          git status --short
-      - name: Build Windows client and fetch matching helpers
+          git apply 30359.patch
+          if ($LASTEXITCODE) { exit $LASTEXITCODE }
+          git add -N pkg/machine/e2e/start_windows_test.go
+          git diff --check
+          if ($LASTEXITCODE) { exit $LASTEXITCODE }
+
+      - name: Build Windows client
         shell: pwsh
         run: |
           .\winmake.ps1 podman-remote
           .\winmake.ps1 win-gvproxy
-          if (!(Test-Path .\bin\windows\win-sshproxy.exe)) { throw 'Missing proxy' }
+
       - name: Verify WSL
         shell: pwsh
         run: |
@@ -52,42 +53,28 @@ jobs:
           if ($LASTEXITCODE) { exit $LASTEXITCODE }
           wsl --version
           if ($LASTEXITCODE) { exit $LASTEXITCODE }
-          wsl --status
-      - name: Prepare directory lock diagnostics
+
+      - name: Static analysis and unit tests
         shell: pwsh
         run: |
-          $folder = Join-Path $env:RUNNER_TEMP "handle-30359"
-          New-Item -ItemType Directory -Path $folder -Force | Out-Null
-          $zip = Join-Path $folder "Handle.zip"
-          Invoke-WebRequest -Uri "https://download.sysinternals.com/files/Handle.zip" -OutFile $zip
-          Expand-Archive -LiteralPath $zip -DestinationPath $folder -Force
-          $handle = Join-Path $folder "handle64.exe"
-          $sig = Get-AuthenticodeSignature -LiteralPath $handle
-          if ($sig.Status -ne 'Valid' -or $sig.SignerCertificate.Subject -notmatch 'Microsoft Corporation') { throw 'Invalid Handle signature' }
-          "PODMAN_30359_HANDLE=$handle" | Out-File -FilePath $env:GITHUB_ENV -Encoding utf8 -Append
-          $path = "pkg/machine/e2e/start_windows_test.go"
-          $source = Get-Content -LiteralPath $path -Raw
-          $needle = 'Expect(os.Remove(dir)).To(Succeed())'
-          if ([regex]::Matches($source, [regex]::Escape($needle)).Count -ne 1) { throw 'Expected one removal assertion' }
-          $replacement = @'
-          if removeErr := os.Remove(dir); removeErr != nil {
-              GinkgoWriter.Printf("30359 removal failed: %v\n", removeErr)
-              diagCtx, cancelDiag := context.WithTimeout(context.Background(), 30*time.Second)
-              defer cancelDiag()
-              diag := exec.CommandContext(diagCtx, os.Getenv("PODMAN_30359_HANDLE"), "-accepteula", "-nobanner", filepath.Base(dir))
-              diag.WaitDelay = 5*time.Second
-              report, diagErr := diag.CombinedOutput()
-              GinkgoWriter.Printf("30359 HANDLE OUTPUT (err=%v):\n%s\n", diagErr, report)
-              Expect(removeErr).To(Succeed())
-          }
-          '@
-          $source.Replace($needle, $replacement.TrimEnd()) | Set-Content -LiteralPath $path -Encoding utf8 -NoNewline
-          gofmt -w $path
+          $tags = 'remote exclude_graphdriver_btrfs containers_image_openpgp'
+          go vet -mod=vendor -tags $tags ./pkg/machine ./pkg/machine/wsl ./pkg/machine/e2e
+          if ($LASTEXITCODE) { exit $LASTEXITCODE }
+          go test -mod=vendor -count=1 -tags $tags ./pkg/machine ./pkg/machine/wsl
           if ($LASTEXITCODE) { exit $LASTEXITCODE }
 
-      - name: Run directory deletion and API forwarding regression
+      - name: Verify directory-lock fix
         shell: pwsh
         run: |
           $env:PODMAN_BINARY = "$PWD\bin\windows\podman.exe"
           $env:CONTAINERS_HELPER_BINARY_DIR = "$PWD\bin\windows"
           .\winmake.ps1 localmachine start_windows_test.go
+
+      - name: Verify existing machine operations
+        shell: pwsh
+        run: |
+          $env:PODMAN_BINARY = "$PWD\bin\windows\podman.exe"
+          $env:CONTAINERS_HELPER_BINARY_DIR = "$PWD\bin\windows"
+          .\winmake.ps1 localmachine start_test.go
+          .\winmake.ps1 localmachine stop_test.go
+          .\winmake.ps1 localmachine api_test.go
